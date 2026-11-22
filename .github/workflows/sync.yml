@@ -1,0 +1,67 @@
+# 从主仓的最新 Release 同步 formula —— **反向拉取**，主仓无需任何跨仓权限。
+#
+# 为什么不在主仓 push：跨仓写需要 PAT 或 deploy key；而 Release 是公开的，
+# tap 用自己的 GITHUB_TOKEN 读就够了（最小权限）。主仓发布后最迟一天内自动同步。
+#
+# 只在内容真的变化时提交，避免每日空提交。
+name: Sync formula from rstun releases
+
+on:
+  schedule:
+    # 每天 05:30 UTC（晚于主仓发布窗口）
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-formula
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Resolve latest rstun release
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/exvlan/rstun/releases/latest --jq .tag_name)"
+          [ -n "$tag" ] || { echo "::error::no latest release"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "latest rstun release: $tag"
+
+      - name: Download rstun.rb
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rstun-release
+          gh release download "${{ steps.latest.outputs.tag }}" \
+            -R exvlan/rstun -p 'rstun.rb' -D /tmp/rstun-release --clobber
+          # 生成器在 formula 前面有一段注释；tap 只保留 class 本体。
+          sed -n '/^class Rstun < Formula/,$p' /tmp/rstun-release/rstun.rb > /tmp/rstun-release/formula.rb
+          test -s /tmp/rstun-release/formula.rb || { echo "::error::empty formula"; exit 1; }
+          echo "--- downloaded ---"
+          head -5 /tmp/rstun-release/formula.rb
+
+      - name: Update formula when changed
+        run: |
+          set -euo pipefail
+          cp /tmp/rstun-release/formula.rb Formula/rstun.rb
+          if git diff --quiet -- Formula/rstun.rb; then
+            echo "formula already up to date" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          ruby -c Formula/rstun.rb >/dev/null 2>&1 || { echo "::error::formula syntax check failed"; exit 1; }
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/rstun.rb
+          git commit -m "sync formula from ${{ steps.latest.outputs.tag }}"
+          git push
+          echo "updated formula to ${{ steps.latest.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
